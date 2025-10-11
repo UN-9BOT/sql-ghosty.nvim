@@ -24,6 +24,16 @@ These approaches are complementary, each valuable in different scenarios, allowi
 - nvim-treesitter with SQL parser installed
 
 ## Instalation
+
+### neovim >= 0.12
+```lua
+vim.pack.add({
+    { src = "https://github.com/pmouraguedes/sql-ghosty.nvim" },
+})
+require("sql-ghosty").setup({})
+```
+
+### lazy.nvim
 ```lua
 {
   "pmouraguedes/sql-ghosty.nvim",
