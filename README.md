@@ -4,7 +4,8 @@
 
 ## Example
 
-![image](https://github.com/user-attachments/assets/b826a9df-1a4b-406e-a9c0-9abec91aa93f)
+<img width="1247" height="258" alt="image" src="https://github.com/user-attachments/assets/a59d7ddd-af0b-4e9d-a82e-a7d761d5d01f" />
+
 
 ## Description
 
