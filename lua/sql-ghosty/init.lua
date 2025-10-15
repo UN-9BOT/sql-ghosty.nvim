@@ -1,203 +1,254 @@
 local M = {}
 
----@alias SqlGhostyOptions
----| 'show_hints_by_default'
+---@alias SqlGhostyOptions 'show_hints_by_default' | 'highlight_group'
 
---- @type table<SqlGhostyOptions, any>
+---@type table<SqlGhostyOptions, any>
 local default_config = {
-	show_hints_by_default = true,
-	highlight_group = "DiagnosticHint",
+  show_hints_by_default = true,
+  highlight_group = "DiagnosticHint",
 }
 
-M.config = default_config
+M.config = vim.deepcopy(default_config)
 
--- Namespace for extmarks
-local ns_id = vim.api.nvim_create_namespace("sql_inlay_hints")
+local NS_ID = vim.api.nvim_create_namespace("sql_inlay_hints")
 
---- @param node TSNode
-local function get_node_type(node)
-	if node and type(node) == "userdata" and node.type then
-		return node:type()
-	end
-	return nil
+---@param node TSNode|nil
+---@return string|nil
+local function ntype(node)
+  if node and type(node) == "userdata" and node.type then
+    return node:type()
+  end
+  return nil
 end
 
---- @param node TSNode insert node to process
---- @param bufnr number buffer number
---- @return string? schema
---- @return string? table_name
---- @return table<string> columns
---- @return table<table<{text: string, row: number, col: number}>> value_rows
---- @return integer? values_start_pos The (row, col) position of the VALUES clause or nil if not found.
-local function process_insert_node(node, bufnr)
-	local schema = nil
-	local table_name = nil
-	local columns = {}
-	local value_rows = {}
-	local values_start_pos = nil
-
-	-- Traverse child nodes of the insert node
-	for child in node:iter_children() do
-		local child_type = get_node_type(child)
-		if not child_type then
-			vim.notify("Skipping invalid node: " .. vim.inspect(child), vim.log.levels.DEBUG)
-			goto continue
-		end
-
-		if child_type == "object_reference" then
-			local schema_node = child:field("schema")[1]
-			if schema_node then
-				schema = vim.treesitter.get_node_text(schema_node, bufnr) or ""
-			end
-			local table_node = child:field("name")[1]
-			if table_node then
-				table_name = vim.treesitter.get_node_text(table_node, bufnr) or ""
-			end
-		elseif child_type == "list" then
-			-- First list is columns, second is values
-			if #columns == 0 then
-				-- Column list
-				for col_node in child:iter_children() do
-					if get_node_type(col_node) == "column" then
-						for subchild in col_node:iter_children() do
-							if get_node_type(subchild) == "identifier" then
-								local col_text = vim.treesitter.get_node_text(subchild, bufnr)
-								if col_text then
-									table.insert(columns, col_text)
-								end
-							end
-						end
-					end
-				end
-			else
-				-- Values list (one row)
-				local row_values = {}
-				for val_node in child:iter_children() do
-					if get_node_type(val_node) == "literal" then
-						local val_text = vim.treesitter.get_node_text(val_node, bufnr)
-						local start_row, start_col = val_node:start()
-						if val_text and start_row and start_col then
-							table.insert(row_values, { text = val_text, row = start_row, col = start_col })
-						end
-					end
-				end
-				if #row_values > 0 then
-					table.insert(value_rows, row_values)
-				end
-				if not values_start_pos then
-					values_start_pos = child:start()
-				end
-			end
-		end
-		::continue::
-	end
-
-	return schema, table_name, columns, value_rows, values_start_pos
+---@param node TSNode
+---@param bufnr integer
+---@return string
+local function ntext(node, bufnr)
+  return vim.treesitter.get_node_text(node, bufnr) or ""
 end
 
---- @param node TSNode
---- @param bufnr number
-local function add_ghost_text_for_insert(node, bufnr)
-	local schema, table_name, columns, value_rows, _ = process_insert_node(node, bufnr)
-	if not table_name or #columns == 0 or #value_rows == 0 then
-		-- vim.notify(
-		-- 	"Incomplete insert node: "
-		-- 		.. vim.inspect({ schema = schema, table_name = table_name, columns = #columns, values = #value_rows }),
-		-- 	vim.log.levels.TRACE
-		-- )
-		return
-	end
-
-	if #columns == 0 then
-		return
-	end
-
-	-- Add ghost text for each value
-	for _, row in ipairs(value_rows) do
-		for i, value in ipairs(row) do
-			if i > #columns then
-				break
-			end
-			vim.api.nvim_buf_set_extmark(bufnr, ns_id, value.row, value.col, {
-				virt_text = { { columns[i] .. ": ", M.config.highlight_group } },
-				virt_text_pos = "inline",
-			})
-		end
-	end
+---@param node TSNode
+---@param cb fun(n: TSNode)
+local function walk_named(node, cb)
+  if not node then
+    return
+  end
+  cb(node)
+  for child in node:iter_children() do
+    if child:named() then
+      walk_named(child, cb)
+    end
+  end
 end
 
-local function show_sql_inlay_hints()
-	local bufnr = vim.api.nvim_get_current_buf()
-	local ok, parser = pcall(vim.treesitter.get_parser, bufnr, "sql")
-	if not ok or not parser then
-		vim.notify("Failed to get SQL parser", vim.log.levels.ERROR)
-		return
-	end
+---@param node TSNode
+---@return boolean
+local function is_value_like(node)
+  local t = ntype(node)
+  if not t then
+    return false
+  end
+  if t == "list" or t == "object_reference" or t == "column" or t == "statement" then
+    return false
+  end
+  return true
+end
 
-	local tree = parser:parse()[1]
-	if not tree then
-		vim.notify("No parse tree available", vim.log.levels.WARN)
-		return
-	end
+---@param bufnr integer
+---@param row integer  -- 0-based
+---@param col integer  -- 0-based end
+---@return integer place_row, integer place_col
+local function place_after_value_or_comma(bufnr, row, col)
+  local line = vim.api.nvim_buf_get_lines(bufnr, row, row + 1, false)[1] or ""
+  local i = col + 1
+  local len = #line
+  while i <= len do
+    local ch = line:sub(i, i)
+    if ch ~= " " and ch ~= "\t" then
+      if ch == "," then
+        return row, i
+      end
+      break
+    end
+    i = i + 1
+  end
+  return row, col
+end
 
-	local root = tree:root()
-	if not root then
-		vim.notify("No root node in parse tree", vim.log.levels.WARN)
-		return
-	end
+---@class InsertInfo
+---@field schema string|nil
+---@field table_name string|nil
+---@field columns string[]
+---@field rows { node: TSNode, row: integer, col: integer, text: string }[][]
 
-	-- Clear previous inlay hints
-	vim.api.nvim_buf_clear_namespace(bufnr, ns_id, 0, -1)
+---@param insert_node TSNode
+---@param bufnr integer
+---@return InsertInfo|nil
+local function parse_insert(insert_node, bufnr)
+  local info = { schema = nil, table_name = nil, columns = {}, rows = {} }
 
-	-- Iterate over statement nodes
-	for statement_node, _ in root:iter_children() do
-		if get_node_type(statement_node) == "statement" then
-			for child in statement_node:iter_children() do
-				if get_node_type(child) == "insert" then
-					add_ghost_text_for_insert(child, bufnr)
-				end
-			end
-		end
-	end
+  for child in insert_node:iter_children() do
+    local ct = ntype(child)
+    if ct == "object_reference" and not info.table_name then
+      local s = child:field("schema")[1]
+      local n = child:field("name")[1]
+      if s then
+        info.schema = ntext(s, bufnr)
+      end
+      if n then
+        info.table_name = ntext(n, bufnr)
+      end
+    end
+  end
+
+  local passed_object_ref, have_columns = false, false
+  for child in insert_node:iter_children() do
+    local ct = ntype(child)
+
+    if ct == "object_reference" then
+      passed_object_ref = true
+    elseif ct == "list" and passed_object_ref and not have_columns then
+      for col_node in child:iter_children() do
+        if ntype(col_node) == "column" then
+          for sub in col_node:iter_children() do
+            if ntype(sub) == "identifier" then
+              local name = ntext(sub, bufnr)
+              if name and #name > 0 then
+                table.insert(info.columns, name)
+              end
+            end
+          end
+        end
+      end
+      have_columns = #info.columns > 0
+    elseif ct == "list" and have_columns then
+      local row_vals = {}
+      for val_node in child:iter_children() do
+        if val_node:named() and is_value_like(val_node) then
+          local sr, sc, er, ec = val_node:range()
+          local text = ntext(val_node, bufnr)
+          table.insert(row_vals, {
+            node = val_node,
+            row = sr,
+            col = sc,
+            text = text,
+          })
+        end
+      end
+      if #row_vals > 0 then
+        table.insert(info.rows, row_vals)
+      end
+    end
+  end
+
+  if not info.table_name or #info.columns == 0 or #info.rows == 0 then
+    return nil
+  end
+  return info
+end
+
+---@param root TSNode
+---@return TSNode[]
+local function collect_insert_nodes(root)
+  local found = {}
+  walk_named(root, function(n)
+    local t = ntype(n)
+    if t == "insert" or t == "insert_statement" then
+      table.insert(found, n)
+    end
+  end)
+  return found
+end
+
+---@param bufnr integer
+local function clear(bufnr)
+  vim.api.nvim_buf_clear_namespace(bufnr, NS_ID, 0, -1)
+end
+
+---@param bufnr integer
+---@param info InsertInfo
+local function render_insert(bufnr, info)
+  for _, row in ipairs(info.rows) do
+    local n = math.min(#info.columns, #row)
+    if n > 0 then
+      for i = 1, n do
+        local v = row[i]
+        local _, _, er, ec = v.node:range()
+        local r, c = place_after_value_or_comma(bufnr, er, ec)
+        local label = " ;;" .. info.columns[i] .. ";; "
+        vim.api.nvim_buf_set_extmark(bufnr, NS_ID, r, c, {
+          virt_text = { { label, M.config.highlight_group } },
+          virt_text_pos = "inline", --inline,
+        })
+      end
+    end
+  end
+end
+
+local function render_all()
+  local bufnr = vim.api.nvim_get_current_buf()
+  local ok, parser = pcall(vim.treesitter.get_parser, bufnr, "sql")
+  if not ok or not parser then
+    vim.notify("[sql_inlay_hints] No SQL parser", vim.log.levels.DEBUG)
+    return
+  end
+
+  local tree = parser:parse()[1]
+  if not tree then
+    return
+  end
+  local root = tree:root()
+  if not root then
+    return
+  end
+
+  clear(bufnr)
+
+  local inserts = collect_insert_nodes(root)
+  for _, ins in ipairs(inserts) do
+    local info = parse_insert(ins, bufnr)
+    if info then
+      render_insert(bufnr, info)
+    end
+  end
 end
 
 M.setup = function(opts)
-	M.config = vim.tbl_extend("force", default_config, opts or {})
-	local cfg = M.config
+  M.config = vim.tbl_extend("force", default_config, opts or {})
+  local cfg = M.config
 
-	vim.api.nvim_create_autocmd({ "BufEnter" }, {
-		pattern = "*.sql",
-		callback = function()
-			if cfg.show_hints_by_default then
-				show_sql_inlay_hints()
-			end
-		end,
-	})
+  local function maybe_render()
+    if cfg.show_hints_by_default and vim.bo.filetype == "sql" then
+      vim.schedule(render_all)
+    end
+  end
 
-	vim.api.nvim_create_autocmd({ "InsertLeave", "TextChanged" }, {
-		pattern = "*.sql",
-		callback = function()
-			if cfg.show_hints_by_default then
-				show_sql_inlay_hints()
-			end
-		end,
-	})
+  vim.api.nvim_create_autocmd({ "BufEnter" }, {
+    group = vim.api.nvim_create_augroup("SqlInlayHintsEnter", { clear = true }),
+    pattern = "*.sql",
+    callback = maybe_render,
+  })
 
-	-- Command to toggle inlay hints manually
-	vim.api.nvim_create_user_command("SqlInlayHintsToggle", function()
-		if vim.bo.filetype ~= "sql" then
-			vim.notify("SqlInlayHintsToggle only works in SQL buffers, see :h setfiletype", vim.log.levels.WARN)
-			return
-		end
+  vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI", "InsertLeave", "BufWritePost" }, {
+    group = vim.api.nvim_create_augroup("SqlInlayHintsUpdate", { clear = true }),
+    pattern = "*.sql",
+    callback = maybe_render,
+  })
 
-		if cfg.show_hints_by_default then
-			vim.api.nvim_buf_clear_namespace(0, ns_id, 0, -1)
-			cfg.show_hints_by_default = false
-		else
-			show_sql_inlay_hints()
-			cfg.show_hints_by_default = true
-		end
-	end, {})
+  vim.api.nvim_create_user_command("SqlInlayHintsToggle", function()
+    if vim.bo.filetype ~= "sql" then
+      vim.notify("SqlInlayHintsToggle works only in SQL buffers", vim.log.levels.WARN)
+      return
+    end
+    if cfg.show_hints_by_default then
+      cfg.show_hints_by_default = false
+      clear(0)
+    else
+      cfg.show_hints_by_default = true
+      render_all()
+    end
+  end, {})
 end
 
 return M
